@@ -95,7 +95,8 @@ class GumbelSoftmaxWrapper(nn.Module):
         :param trainable_temperature: If set to True, the temperature becomes a trainable parameter of the model
         :params straight_through: Whether straigh-through Gumbel Softmax is used
         """
-        super(GumbelSoftmaxWrapper, self).__init__()
+        # super(GumbelSoftmaxWrapper, self).__init__()
+        super().__init__()
         self.agent = agent
         self.straight_through = straight_through
         if not trainable_temperature:
@@ -146,6 +147,7 @@ class SymbolGameGS(nn.Module):
         loss: Callable,
         train_logging_strategy: Optional[LoggingStrategy] = None,
         test_logging_strategy: Optional[LoggingStrategy] = None,
+        sender_update_freq=1
     ):
         """
         :param sender: Sender agent. sender.forward() has to output log-probabilities over the vocabulary.
@@ -160,7 +162,8 @@ class SymbolGameGS(nn.Module):
         :param train_logging_strategy, test_logging_strategy: specify what parts of interactions to persist for
             later analysis in the callbacks.
         """
-        super(SymbolGameGS, self).__init__()
+        # super(SymbolGameGS, self).__init__()
+        super().__init__()
         self.sender = sender
         self.receiver = receiver
         self.loss = loss
@@ -174,6 +177,10 @@ class SymbolGameGS(nn.Module):
             if test_logging_strategy is None
             else test_logging_strategy
         )
+        self.sender_update_freq = sender_update_freq  # Frequency of sender updates (in batches)
+        self.global_batch_counter = 0  # Count total number of processed batches
+        self.sender_loss_accumulator = 0  # Accumulate loss for sender
+        self.accumulated_batches = 0  # Count batches for averaging
 
     def forward(self, sender_input, labels, receiver_input=None, aux_input=None):
         message = self.sender(sender_input, aux_input)
@@ -198,6 +205,47 @@ class SymbolGameGS(nn.Module):
         )
 
         return loss.mean(), interaction
+
+    def backward(self, loss, optimizer):
+        """
+        Custom backward method to control sender updates based on the sender_update_freq.
+        """
+        # Accumulate the loss for sender and count batches
+        self.sender_loss_accumulator += loss.item()
+        self.accumulated_batches += 1
+
+        # Accumulate gradients for both sender and receiver
+        loss.backward()
+
+        # Increment the global batch counter
+        self.global_batch_counter += 1
+
+        # Check if sender should be updated (every `w` batches)
+        if self.global_batch_counter % self.sender_update_freq == 0:
+            # Use the average loss over the last `w` batches to update sender
+            avg_loss = self.sender_loss_accumulator / self.accumulated_batches
+
+            # Adjust the gradients for the sender only
+            for param in self.sender.parameters():
+                if param.grad is not None:
+                    param.grad *= avg_loss / loss.item()
+
+            # Perform optimizer step for both sender and receiver
+            optimizer.step()
+
+            # Reset sender-specific accumulators
+            self.sender_loss_accumulator = 0
+            self.accumulated_batches = 0
+        else:
+            # Freeze sender parameters and update only receiver
+            for param in self.sender.parameters():
+                param.requires_grad = False
+            optimizer.step()
+            for param in self.sender.parameters():
+                param.requires_grad = True  # Re-enable sender gradients
+
+        # Zero gradients after optimizer step
+        optimizer.zero_grad()
 
 
 class RelaxedEmbedding(nn.Embedding):
@@ -250,7 +298,8 @@ class SymbolReceiverWrapper(nn.Module):
     """
 
     def __init__(self, agent, vocab_size, agent_input_size):
-        super(SymbolReceiverWrapper, self).__init__()
+        # super(SymbolReceiverWrapper, self).__init__()
+        super().__init__()
         self.agent = agent
         self.embedding = RelaxedEmbedding(vocab_size, agent_input_size)
 
