@@ -202,47 +202,30 @@ class Trainer:
         n_batches = 0
         interactions = []
 
-        self.game.train()
+        self.game.train()  # Set the game to training mode
 
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad()  # Clear gradients at the start
 
         for batch_id, batch in enumerate(self.train_data):
             if not isinstance(batch, Batch):
                 batch = Batch(*batch)
             batch = batch.to(self.device)
 
+            # Use autocast for mixed precision if scaler is provided
             context = autocast() if self.scaler else nullcontext()
             with context:
                 optimized_loss, interaction = self.game(*batch)
 
+                # Normalize loss if using gradient accumulation
                 if self.update_freq > 1:
-                    # throughout EGG, we minimize _mean_ loss, not sum
-                    # hence, we need to account for that when aggregating grads
                     optimized_loss = optimized_loss / self.update_freq
 
-            if self.scaler:
-                self.scaler.scale(optimized_loss).backward()
-            else:
-                optimized_loss.backward()
-
-            if batch_id % self.update_freq == self.update_freq - 1:
-                if self.scaler:
-                    self.scaler.unscale_(self.optimizer)
-
-                if self.grad_norm:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.game.parameters(), self.grad_norm
-                    )
-                if self.scaler:
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    self.optimizer.step()
-
-                self.optimizer.zero_grad()
+            # Use the custom backward function of the game to manage sender updates
+            self.game.backward(optimized_loss, self.optimizer)
 
             n_batches += 1
             mean_loss += optimized_loss.detach()
+
             if (
                 self.distributed_context.is_distributed
                 and self.aggregate_interaction_logs
@@ -255,11 +238,13 @@ class Trainer:
 
             interactions.append(interaction)
 
+        # Step the learning rate scheduler if one is provided
         if self.optimizer_scheduler:
             self.optimizer_scheduler.step()
 
-        mean_loss /= n_batches
+        mean_loss /= n_batches  # Compute mean loss over all batches
         full_interaction = Interaction.from_iterable(interactions)
+
         return mean_loss.item(), full_interaction
 
     def train(self, n_epochs):
